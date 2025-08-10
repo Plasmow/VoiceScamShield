@@ -1,1 +1,6 @@
-flask flask-sockets
+aiortc
+aiohttp
+av
+numpy
+webrtcvad
+librosa
