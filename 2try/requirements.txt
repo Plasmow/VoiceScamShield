@@ -1,0 +1,7 @@
+aiortc
+aiohttp
+av
+numpy
+scipy
+webrtcvad
+librosa
