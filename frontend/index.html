@@ -1,0 +1,278 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>Voice Scam Shield — Prototype</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<style>
+  :root{
+    --bg:#f3f6fb; --card:#ffffff; --accent:#1e90ff; --danger:#ff4d4f;
+    --muted:#6b7280;
+  }
+  body{font-family:Inter,system-ui,Arial; background:var(--bg); margin:0; padding:28px; color:#111}
+  .container{max-width:1000px;margin:0 auto;display:grid;grid-template-columns:1fr 360px;gap:20px}
+  .card{background:var(--card);border-radius:12px;padding:18px;box-shadow:0 6px 18px rgba(16,24,40,0.06)}
+  header{display:flex;align-items:center;gap:12px;margin-bottom:12px}
+  h1{font-size:20px;margin:0}
+  .controls{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+  input[type="text"]{padding:8px;border-radius:8px;border:1px solid #e6e9ee;width:160px}
+  button{background:var(--accent);color:#fff;border:0;padding:8px 12px;border-radius:10px;cursor:pointer}
+  button.ghost{background:transparent;color:var(--accent);border:1px solid rgba(30,144,255,0.12)}
+  .small{font-size:13px;padding:6px 10px}
+  .log{height:300px;overflow:auto;background:#0f1724;color:#cbd5e1;padding:12px;border-radius:8px;font-family:monospace;font-size:13px}
+  .right .status{display:flex;flex-direction:column;gap:12px}
+  .meter{height:14px;border-radius:8px;background:#f1f5f9;overflow:hidden}
+  .meter > i{display:block;height:100%;width:0%;background:linear-gradient(90deg,var(--accent),#00c2ff);transition:width 300ms}
+  .badge{padding:6px 10px;border-radius:999px;background:#eef2ff;color:var(--accent);font-weight:600}
+  .transcript{max-height:200px;overflow:auto;margin-top:8px}
+  .segment{padding:8px;border-radius:8px;border:1px solid #f1f5f9;margin-bottom:8px}
+  .lang{font-weight:600;color:var(--muted);font-size:12px;margin-left:8px}
+  footer{margin-top:12px;font-size:13px;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="container">
+  <div>
+    <div class="card">
+      <header>
+        <div>
+          <h1>Voice Scam Shield — Live Demo</h1>
+          <div style="color:var(--muted);font-size:13px">Real-time scam intent & anti-spoofing (Whisper + heuristic)</div>
+        </div>
+      </header>
+
+      <div class="controls" style="margin-bottom:12px">
+        Call ID: <input id="callId" type="text" value="demo1" />
+        <button id="startBtn">Start Mic</button>
+        <button id="stopBtn" class="ghost" disabled>Stop</button>
+        <label style="display:flex;align-items:center;gap:6px"><select id="speakerSel"><option value="caller">caller</option><option value="user">user</option></select></label>
+      </div>
+
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px">
+        <input id="fileInput" type="file" accept=".wav" />
+        <button id="sendFile" class="small">Send file to backend as caller</button>
+        <button id="playFile" class="small ghost">Play locally</button>
+      </div>
+
+      <div style="display:flex;gap:12px">
+        <div style="flex:1">
+          <div style="margin-bottom:8px;font-size:13px;color:var(--muted)">Live logs</div>
+          <div id="log" class="log"></div>
+        </div>
+        <div style="width:260px">
+          <div class="card right" style="padding:12px">
+            <div class="status">
+              <div style="display:flex;justify-content:space-between;align-items:center">
+                <div>Risk</div>
+                <div class="badge" id="riskLabel">safe</div>
+              </div>
+              <div class="meter" role="progressbar" aria-valuemin="0" aria-valuemax="1">
+                <i id="riskBar"></i>
+              </div>
+              <div style="display:flex;justify-content:space-between;font-size:13px;color:var(--muted);margin-top:8px">
+                <div>Score: <span id="riskScore">0.00</span></div>
+                <div id="langTag" class="lang">lang: -</div>
+              </div>
+
+              <div style="margin-top:12px;font-weight:600">Latest transcripts</div>
+              <div id="transcriptList" class="transcript"></div>
+
+              <div style="margin-top:12px">
+                <button id="downloadReport" class="small ghost" disabled>Download JSON report</button>
+              </div>
+
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <footer>Tip: use WAV file streaming to test caller audio without loopback devices.</footer>
+    </div>
+  </div>
+
+  <div>
+    <div class="card">
+      <h3 style="margin:0 0 8px 0">How it works</h3>
+      <ol style="color:var(--muted)">
+        <li>Capture mic chunks or stream a WAV file to backend via WebSocket</li>
+        <li>Backend runs Whisper for ASR + anti-spoofing heuristic</li>
+        <li>UI computes weighted risk score and shows live alerts</li>
+      </ol>
+      <div style="margin-top:12px;color:var(--muted)">Made for learning — replace heuristic anti-spoof with AASIST for production-grade detection.</div>
+    </div>
+  </div>
+</div>
+
+<script>
+/* FRONTEND LOGIC (keeps existing behaviors + nicer UI) */
+const WS_BASE = "ws://localhost:8000/ws/";
+let ws = null;
+let audioCtx = null, mediaStream = null, sourceNode = null, processor = null;
+let buffer = [], sending=false, segments=[];
+const sendInterval = 1000;
+const riskThreshold = 0.75;
+
+function log(msg){
+  const el = document.getElementById('log');
+  el.textContent = (new Date()).toLocaleTimeString() + " - " + msg + "\\n" + el.textContent;
+}
+
+function floatTo16BitPCM(float32Array){
+  const l = float32Array.length;
+  const buf = new ArrayBuffer(l*2);
+  const view = new DataView(buf);
+  let offset = 0;
+  for (let i=0;i<l;i++){
+    let s = Math.max(-1, Math.min(1, float32Array[i]));
+    view.setInt16(offset, s < 0 ? s*0x8000 : s*0x7FFF, true);
+    offset+=2;
+  }
+  return new Uint8Array(buf);
+}
+
+async function ensureWS(callId){
+  if (ws && ws.readyState === 1) return ws;
+  return new Promise((resolve, reject) => {
+    ws = new WebSocket(WS_BASE + callId);
+    ws.onopen = () => { log('WS connected ' + callId); resolve(ws); };
+    ws.onerror = (e) => { log('WS error - make sure backend is running'); reject(e); };
+    ws.onclose = ()=> log('WS closed');
+    ws.onmessage = (ev) => {
+      const m = JSON.parse(ev.data);
+      if (m.type === 'analysis') handleAnalysis(m);
+      else if (m.type === 'report'){ log('REPORT: ' + JSON.stringify(m.report)); document.getElementById('downloadReport').disabled=false; window.latestReport=m.report; }
+      else log('MSG: ' + ev.data);
+    };
+  });
+}
+
+async function startMic(){
+  const callId = document.getElementById('callId').value || 'demo1';
+  try{
+    await ensureWS(callId);
+  }catch(e){
+    log('Failed to open WS: ' + e);
+    return;
+  }
+  try{
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)({sampleRate:16000});
+    mediaStream = await navigator.mediaDevices.getUserMedia({audio:true});
+    sourceNode = audioCtx.createMediaStreamSource(mediaStream);
+    processor = audioCtx.createScriptProcessor(4096,1,1);
+    sourceNode.connect(processor); processor.connect(audioCtx.destination);
+    processor.onaudioprocess = (e)=>{ buffer.push(new Float32Array(e.inputBuffer.getChannelData(0))); };
+    sending = true;
+    sendLoop(callId);
+    document.getElementById('startBtn').disabled = true;
+    document.getElementById('stopBtn').disabled = false;
+    log('Mic started');
+  }catch(err){
+    log('Mic start error: ' + err.message);
+  }
+}
+
+async function sendLoop(callId){
+  while(sending){
+    await new Promise(r=>setTimeout(r, sendInterval));
+    if (!buffer.length) continue;
+    let len=0; for (const b of buffer) len+=b.length;
+    const tmp = new Float32Array(len); let off=0; for (const b of buffer){ tmp.set(b, off); off+=b.length; }
+    buffer = [];
+    const pcm = floatTo16BitPCM(tmp);
+    const b64 = btoa(String.fromCharCode(...pcm));
+    const speaker = document.getElementById('speakerSel').value;
+    try { ws.send(JSON.stringify({type:'chunk', speaker, timestamp_ms: Date.now(), audio_chunk: b64})); log('Sent mic chunk'); }
+    catch(e){ log('Failed send chunk: ' + e.message); }
+  }
+}
+
+function stopMic(){
+  sending = false;
+  if (processor) { processor.disconnect(); processor=null; }
+  if (sourceNode) { sourceNode.disconnect(); sourceNode=null; }
+  if (mediaStream) { mediaStream.getTracks().forEach(t=>t.stop()); mediaStream=null; }
+  try{ if (ws && ws.readyState===1) { ws.send(JSON.stringify({type:'end_call'})); ws.close(); } }catch(e){}
+  document.getElementById('startBtn').disabled = false;
+  document.getElementById('stopBtn').disabled = true;
+  log('Stopped');
+}
+
+async function streamFile(file){
+  const callId = document.getElementById('callId').value || 'demo1';
+  try{ await ensureWS(callId); } catch(e){ log('WS error: ' + e); return; }
+  const arrayBuf = await file.arrayBuffer();
+  const offlineCtx = new (window.OfflineAudioContext || window.webkitOfflineAudioContext)(1,1,16000);
+  const tempCtx = new (window.AudioContext || window.webkitAudioContext)();
+  const audioBuf = await tempCtx.decodeAudioData(arrayBuf.slice(0));
+  // Resample if needed to 16k
+  let resampled = audioBuf.getChannelData(0);
+  if (audioBuf.sampleRate !== 16000){
+    const offline = new OfflineAudioContext(1, Math.ceil(resampled.length * 16000 / audioBuf.sampleRate), 16000);
+    const buf = offline.createBuffer(1, resampled.length, audioBuf.sampleRate);
+    buf.copyToChannel(resampled, 0);
+    const src = offline.createBufferSource(); src.buffer = buf; src.connect(offline.destination); src.start(0);
+    const rendered = await offline.startRendering();
+    resampled = rendered.getChannelData(0);
+  }
+  const chunkSize = 16000; // 1s
+  for (let i=0;i<resampled.length;i+=chunkSize){
+    const chunk = resampled.subarray(i, i+chunkSize);
+    const pcm = floatTo16BitPCM(chunk);
+    const b64 = btoa(String.fromCharCode(...pcm));
+    try { ws.send(JSON.stringify({type:'chunk', speaker:'caller', timestamp_ms: Date.now(), audio_chunk: b64})); log('Sent file chunk ' + (i/chunkSize+1)); }
+    catch(e){ log('Send error: ' + e.message); break; }
+    await new Promise(r=>setTimeout(r, 200));
+  }
+}
+
+function handleAnalysis(m){
+  // risk = 0.7*intent_conf + 0.3*spoof_conf
+  const intentC = m.intent_confidence || 0;
+  const spoofC = m.spoof_confidence || 0;
+  const risk = (intentC*0.7) + (spoofC*0.3);
+  document.getElementById('riskScore').textContent = risk.toFixed(2);
+  document.getElementById('riskBar').style.width = Math.min(1, risk) * 100 + "%";
+  const labelEl = document.getElementById('riskLabel');
+  if (risk > riskThreshold) { labelEl.textContent = 'SCAM'; labelEl.style.background = '#fff0f0'; labelEl.style.color = '#b30000'; }
+  else if (m.intent_label === 'scam') { labelEl.textContent = 'suspicious'; labelEl.style.background = '#fff7ed'; labelEl.style.color = '#b36b00'; }
+  else { labelEl.textContent = 'safe'; labelEl.style.background = '#eef6ff'; labelEl.style.color = '#0b69ff'; }
+  document.getElementById('langTag').textContent = 'lang: ' + (m.language || '-');
+  // add to transcript list
+  const div = document.createElement('div'); div.className = 'segment';
+  div.innerHTML = `<div style="font-weight:600">${m.speaker} — ${m.intent_label} <span style="float:right">${(m.spoof_label||'')} (${(m.spoof_confidence||0)})</span></div>
+                   <div style="color:var(--muted);margin-top:6px">${m.text}</div>
+                   <div style="font-size:12px;margin-top:6px;color:var(--muted)">rationale: ${m.rationale || '-'}</div>`;
+  const list = document.getElementById('transcriptList'); list.prepend(div);
+  segments.push(m);
+  // small TTS alert if high risk (non-intrusive)
+  if (risk > riskThreshold){
+    try{
+      const utter = new SpeechSynthesisUtterance('Warning: possible scam call. Do not share codes or money.');
+      utter.lang = (m.language && m.language.startsWith('fr')) ? 'fr-FR' : 'en-US';
+      utter.volume = 0.7; utter.rate = 1.0;
+      window.speechSynthesis.speak(utter);
+    }catch(e){ log('TTS not available'); }
+  }
+}
+
+document.getElementById('startBtn').onclick = startMic;
+document.getElementById('stopBtn').onclick = stopMic;
+document.getElementById('sendFile').onclick = ()=> {
+  const f = document.getElementById('fileInput').files[0];
+  if (!f) return alert('Select a WAV file first');
+  streamFile(f);
+};
+document.getElementById('playFile').onclick = ()=>{
+  const f = document.getElementById('fileInput').files[0];
+  if (!f) return alert('Select a file');
+  const audio = new Audio(URL.createObjectURL(f)); audio.play();
+  log('Playing file locally');
+};
+document.getElementById('downloadReport').onclick = ()=>{
+  const report = {call_id:document.getElementById('callId').value||'demo1', segments, summary:'Prototype report'};
+  const blob = new Blob([JSON.stringify(report,null,2)],{type:'application/json'});
+  const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download='call_report.json'; a.click(); URL.revokeObjectURL(url);
+};
+</script>
+</body>
+</html>

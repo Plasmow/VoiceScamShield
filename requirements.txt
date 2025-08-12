@@ -1,6 +1,10 @@
-aiortc
-aiohttp
-av
+--- requirements.txt ---
+fastapi
+uvicorn[standard]
 numpy
-webrtcvad
+pydub
+soundfile
 librosa
+python-multipart
+websockets
+openai-whisper
