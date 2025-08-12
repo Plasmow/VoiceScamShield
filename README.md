@@ -1,42 +1,67 @@
-# Voice Scam Shield - 24h Prototype
+# 🎙️ Voice Scam Shield – Multilingual AI for Real-Time Call Scam Detection
 
-## What this prototype does
-- Frontend: captures microphone audio via WebRTC (getUserMedia + ScriptProcessor) and streams 1s PCM chunks to backend WebSocket.
-- Backend: receives chunks, saves WAV files, runs _stub_ speech-to-text and _stub_ anti-spoofing heuristics, and returns JSON analysis messages with the expected fields for parts B and C.
+Voice Scam Shield is a real-time call monitoring system designed to **detect potential scam or fraud calls** using AI speech-to-text and intent classification.  
+It can handle **multiple languages**, works with both **live microphone input** and **audio files**, and detects both **scam intent** and **voice spoofing**.
 
-This is a functioning **integration prototype** you can run locally and demonstrate the end-to-end pipeline. Replace the stub functions with Whisper/AASIST models later for production-quality results.
+---
 
-## Run (local)
-1. Create a virtualenv and install requirements:
+## 🚀 Features
+- **🎧 Real-time audio streaming** via WebRTC
+- **🌍 Multilingual transcription** powered by OpenAI Whisper
+- **🤖 AI intent detection** using multilingual transformer models (Hugging Face)
+- **🔍 Voice spoof detection** with spectral feature analysis
+- **📈 Smoothed confidence scores** for stable predictions
+- **💻 Simple web frontend** for live visualization and transcripts
+- **🛠 Fallback heuristics** when AI models are unavailable
 
+---
+
+## 🛑 Problem
+Phone scams are a growing problem worldwide, often targeting vulnerable populations.  
+Existing solutions usually only block known numbers or work after the scam has already occurred.  
+Voice Scam Shield proactively analyzes the call **in real time** to warn the user before sensitive information is shared.
+
+---
+
+## 🎯 Target Audience
+- Elderly or vulnerable individuals
+- Customer service teams handling high volumes of calls
+- Businesses at risk of phishing or vishing attacks
+
+---
+
+## 🧠 How It Works
+1. **Audio capture** from microphone or audio file (via browser frontend)
+2. **Real-time streaming** to the backend over WebSocket
+3. **Speech-to-text** transcription with Whisper
+4. **Intent detection** using multilingual AI model (`joeddav/xlm-roberta-large-xnli`)
+5. **Spoof detection** using audio spectral analysis
+6. **Smooth scoring** to avoid false jumps in predictions
+7. **Frontend display** of transcript, intent, confidence, and spoof score
+
+---
+
+## 🛠 Tech Stack
+- **Backend:** FastAPI + WebSocket
+- **Speech-to-Text:** OpenAI Whisper
+- **Intent Detection:** Hugging Face Transformers
+- **Audio Processing:** librosa, soundfile, numpy
+- **Frontend:** HTML + JavaScript (WebRTC)
+- **Model Serving:** Local inference (no cloud dependency after install)
+
+---
+
+## 📦 Installation
 ```bash
-python -m venv .venv
-source .venv/bin/activate
+git clone https://github.com/YOUR_USERNAME/VoiceScamShield.git
+cd VoiceScamShield
+
+# Create a virtual environment (optional but recommended)
+python -m venv venv
+source venv/bin/activate  # or venv\Scripts\activate on Windows
+
+# Install dependencies
 pip install -r requirements.txt
-```
 
-2. Run the backend:
-
-```bash
-uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
-```
-
-3. Open `frontend/index.html` in Chrome (file://) or serve it with a simple HTTP server (recommended):
-
-```bash
-python -m http.server 8080
-# then open http://localhost:8080/frontend/index.html
-```
-
-4. Allow microphone access. Choose a Call ID, select Speaker, press Start. The page will stream chunks to the backend. Analysis messages will show live in the UI.
-
-## Outputs
-- Live JSON messages over WebSocket with keys:
-  - `speaker`, `timestamp_ms`, `text`, `language`, `intent_label`, `intent_confidence`, `rationale`, `spoof_label`, `spoof_confidence`.
-- Saved WAV files in `./calls/<call_id>/`.
-- End-of-call report JSON message with list of saved segments.
-
-## How to swap stubs for real models
-- Replace `stt_stub` in `backend/main.py` with a call to Whisper (whisperx, openai-whisper, or an ASR service).
-- Replace `spoof_stub` with a real anti-spoofing model (AASIST/RawNet2). Emit `spoof_label` and `spoof_confidence` as shown.
-
+# Install protobuf & sentencepiece for Hugging Face models
+pip install protobuf sentencepiece
