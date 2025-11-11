@@ -72,23 +72,19 @@ pip install -r requirements.txt
 # Install protobuf & sentencepiece for Hugging Face models
 pip install protobuf sentencepiece
 
-
+```
 ## ▶️ Quick Launch
 
 Backend:
-```powershell
+```powershell/bash
 uvicorn backend.main:app --reload
 ```
-Opens at: http://127.0.0.1:8000/
 
-Frontend (static HTML/JS):
+Frontend (static HTML/JS) on another terminal:
 ```powershell
 cd frontend
 py -m http.server 5500
 ```
-Opens at: http://127.0.0.1:5500/
+Opens at: http://127.0.0.1:5500/ 
 
-WebSocket the frontend should use:
-```
-ws://127.0.0.1:8000/ws/{call_id}
-```
+Alternative for frontend : open index.html
