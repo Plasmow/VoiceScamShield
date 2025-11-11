@@ -3,6 +3,12 @@
 Voice Scam Shield is a real-time call monitoring system designed to **detect potential scam or fraud calls** using AI speech-to-text transcription and intent classification.  
 It can handle **multiple languages**, works with both **live microphone input** and **audio files**, and detects both **scam intent** and **voice spoofing**.
 
+<p align="center">
+	<img src="demoimages/demo1.png" alt="Voice Scam Shield demo" width="720" />
+	<br>
+	<em>Example screenshot of the Voice Scam Shield interface.</em>
+</p>
+
 ---
 
 ## 🚀 Features
