@@ -153,6 +153,8 @@ async def spoof_stub_from_array(audio_np):
     else:
         return ("synthetic", 0.5)
 
+    
+
 
 def detect_intent(transcript):
     transcript = transcript.strip()
@@ -160,13 +162,19 @@ def detect_intent(transcript):
         return "safe", 0.0, "No speech detected"
 
     if intent_model:
-        preds = intent_model(transcript, truncation=True)
-        label = preds[0]["label"].lower()
-        score = float(preds[0]["score"])
-        if any(x in label for x in ["scam", "fraud", "spam", "illegal"]):
-            return "scam", score, f"ML model predicted {label}"
+
+        candidate_labels = ["scam", "fraud", "spam", "illegal", "legitimate", "safe"]
+        
+        preds = intent_model(transcript, candidate_labels=candidate_labels, truncation=True)
+        
+        top_label = preds["labels"][0].lower()
+        score = float(preds["scores"][0])
+        
+        if top_label in ["scam", "fraud", "spam", "illegal"]:
+            return "scam", score, f"ML model predicted {top_label}"
         else:
-            return "safe", score, f"ML model predicted {label}"
+            return "safe", score, f"ML model predicted {top_label}"
+
 
     lower = transcript.lower()
     scam_keywords = [
