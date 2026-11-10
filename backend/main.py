@@ -1,79 +1,109 @@
 # backend/main.py
-import os
-import json
-import base64
 import asyncio
+import base64
+import json
+import os
+from contextlib import asynccontextmanager
+
 import numpy as np
 import soundfile as sf
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 
-# DEBUG toggle
-DEBUG = True
+DEBUG = os.environ.get("VSS_DEBUG", "1") == "1"
 
-# Try to import whisper, librosa, transformers
+# Heavy ML deps are optional: the server still runs (with heuristic fallbacks)
+# if they are missing, so the demo never hard-fails on a fresh machine.
 try:
     import whisper
-except Exception:
+except Exception as e:
+    print("Whisper not importable (%s); STT will fall back to heuristics." % e)
     whisper = None
 
 try:
     import librosa
-except Exception:
+except Exception as e:
+    print("librosa not importable (%s); spoof detection will fall back to stub." % e)
     librosa = None
 
 try:
     from transformers import pipeline
-except Exception:
+except Exception as e:
+    print("transformers not importable (%s); intent detection will use keywords." % e)
     pipeline = None
 
-app = FastAPI()
-CALLS_DIR = "./calls"
-os.makedirs(CALLS_DIR, exist_ok=True)
-
-# Globals
-model = None
-intent_model = None
-call_saved_segments = {}
-speech_buffers = {}
-score_history = {}
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+FRONTEND_DIR = os.path.join(ROOT_DIR, "frontend")
+CALLS_DIR = os.path.join(ROOT_DIR, "calls")
 
 # Config
-MIN_SAMPLES_TO_TRANSCRIBE = 16000  # 1 sec @ 16kHz
+INTENT_MODEL_NAME = os.environ.get(
+    "VSS_INTENT_MODEL", "joeddav/xlm-roberta-large-xnli"
+)
+WHISPER_MODEL_NAME = os.environ.get("VSS_WHISPER_MODEL", "tiny")
+MIN_SAMPLES_TO_TRANSCRIBE = 16000  # 1 second @ 16 kHz
+WINDOW_SIZE = 5  # number of intent scores smoothed together
+INTENT_LABELS = ["scam or fraud", "legitimate business"]
+INTENT_TEMPLATE = "This phone call is {}."
+SCAM_LABELS = {"scam or fraud"}
+
+# Model handles, loaded lazily in the background so the server is reachable
+# immediately (a first run may download several GB and we do not want to
+# block startup while that happens).
+model = None
+intent_model = None
 
 
-@app.on_event("startup")
-async def startup_event():
+@asynccontextmanager
+async def lifespan(app):
+    # Loading models is synchronous work (downloads + torch init); running it
+    # in the default thread executor keeps the event loop responsive so
+    # startup finishes and /health answers right away.
+    asyncio.get_event_loop().run_in_executor(None, load_models_sync)
+    yield
+
+
+app = FastAPI(title="Voice Scam Shield", lifespan=lifespan)
+os.makedirs(CALLS_DIR, exist_ok=True)
+
+
+def load_models_sync():
+    """Load Whisper + the zero-shot intent model.
+
+    Runs in a worker thread: loading and downloading models is synchronous
+    work and would starve the event loop if executed directly in a task.
+    """
     global model, intent_model
 
-    # Load Whisper
     if whisper is None:
-        print("Whisper not installed; using STT stub.")
-        model = None
+        print("[models] Whisper unavailable; STT stub will be used.")
     else:
         try:
-            model = whisper.load_model("tiny")
-            print("Whisper model loaded (tiny).")
+            print("[models] Loading Whisper (%s)..." % WHISPER_MODEL_NAME)
+            model = whisper.load_model(WHISPER_MODEL_NAME)
+            print("[models] Whisper loaded.")
         except Exception as e:
-            print("Failed to load Whisper model:", e)
-            model = None
+            print("[models] Failed to load Whisper:", e)
 
-    # Load intent detection model
     if pipeline is None:
-        print("Transformers not installed; intent detection will use fallback.")
-        intent_model = None
+        print("[models] transformers unavailable; keyword fallback will be used.")
     else:
         try:
-            print("Loading intent detection model...")
-            intent_model = pipeline(
-                "text-classification",
-                model="joeddav/xlm-roberta-large-xnli",
-                tokenizer="joeddav/xlm-roberta-large-xnli"
-            )
-            print("Intent model loaded.")
+            print("[models] Loading intent model (%s)..." % INTENT_MODEL_NAME)
+            # NOTE: this model is an NLI classifier and must be run through the
+            # zero-shot-classification pipeline (not text-classification).
+            intent_model = pipeline("zero-shot-classification", model=INTENT_MODEL_NAME)
+            print("[models] Intent model loaded.")
         except Exception as e:
-            print("Could not load intent model; using fallback:", e)
+            print("[models] Could not load intent model; using fallback:", e)
             intent_model = None
+
+
+# Per-call state
+call_saved_segments = {}  # call_id -> {speaker: [(ts, fname), ...]}
+speech_buffers = {}       # call_id -> {speaker: [np.array, ...]}
+score_history = {}        # call_id -> {speaker: [float, ...]}
 
 
 def ensure_call(call_id):
@@ -85,13 +115,14 @@ def ensure_call(call_id):
 
 
 def save_chunk(call_id, speaker, timestamp_ms, pcm_bytes):
-    fname = os.path.join(CALLS_DIR, call_id, f"{speaker}_{timestamp_ms}.wav")
+    fname = os.path.join(CALLS_DIR, call_id, "%s_%s.wav" % (speaker, timestamp_ms))
     data = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
     sf.write(fname, data, 16000, subtype="PCM_16")
     return fname
 
 
 async def stt_stub_from_array(audio_np):
+    """Cheap placeholder STT when Whisper isn't available."""
     if audio_np is None or len(audio_np) == 0:
         return "", "unknown"
     rms = float(np.sqrt(np.mean(audio_np**2)))
@@ -101,23 +132,22 @@ async def stt_stub_from_array(audio_np):
         return "Bonjour, c'est le service client, transférez le code que je vous ai envoyé", "fr"
     elif rms > 0.06:
         return "Pouvez-vous confirmer votre numéro de compte ?", "fr"
-    else:
-        return "Bonjour, je voudrais juste vérifier des informations", "fr"
+    return "Bonjour, je voudrais juste vérifier des informations", "fr"
 
 
 async def stt_whisper_from_array(audio_np):
     if model is None:
         return await stt_stub_from_array(audio_np)
-    audio = audio_np.astype(np.float32)
-    loop = asyncio.get_event_loop()
-
-    def transcribe_sync(a):
-        return model.transcribe(a, language=None)
-
     try:
-        res = await loop.run_in_executor(None, transcribe_sync, audio)
+        loop = asyncio.get_running_loop()
+
+        def transcribe_sync(a):
+            # fp16=False: the demo runs on CPU and float16 is unsupported there
+            return model.transcribe(a, language=None, fp16=False)
+
+        res = await loop.run_in_executor(None, transcribe_sync, audio_np)
         text = res.get("text", "").strip()
-        language = res.get("language", None) or "unknown"
+        language = res.get("language") or "unknown"
         return text, language
     except Exception as e:
         if DEBUG:
@@ -126,9 +156,10 @@ async def stt_whisper_from_array(audio_np):
 
 
 async def spoof_real_from_array(audio_np):
+    """Heuristic anti-spoofing based on spectral flatness."""
     try:
         if librosa is None:
-            raise Exception("librosa not installed")
+            raise RuntimeError("librosa not installed")
         if audio_np is None or len(audio_np) < 512:
             return await spoof_stub_from_array(audio_np)
         S = np.abs(librosa.stft(audio_np.astype(float), n_fft=512, hop_length=256))
@@ -138,9 +169,10 @@ async def spoof_real_from_array(audio_np):
             return ("synthetic", 0.85)
         elif score < 0.04:
             return ("synthetic", 0.6)
-        else:
-            return ("genuine", 0.9)
-    except Exception:
+        return ("genuine", 0.9)
+    except Exception as e:
+        if DEBUG:
+            print("Spectral spoof analysis failed; using stub:", e)
         return await spoof_stub_from_array(audio_np)
 
 
@@ -150,41 +182,96 @@ async def spoof_stub_from_array(audio_np):
     rms = float(np.sqrt(np.mean(audio_np**2)))
     if rms > 0.12:
         return ("genuine", 0.8)
-    else:
-        return ("synthetic", 0.5)
-
-    
+    return ("synthetic", 0.5)
 
 
 def detect_intent(transcript):
+    """Classify a transcript as scam or safe, with a confidence + rationale."""
     transcript = transcript.strip()
     if not transcript:
         return "safe", 0.0, "No speech detected"
 
-    if intent_model:
-
-        candidate_labels = ["scam", "fraud", "spam", "illegal", "legitimate", "safe"]
-        
-        preds = intent_model(transcript, candidate_labels=candidate_labels, truncation=True)
-        
-        top_label = preds["labels"][0].lower()
-        score = float(preds["scores"][0])
-        
-        if top_label in ["scam", "fraud", "spam", "illegal"]:
-            return "scam", score, f"ML model predicted {top_label}"
-        else:
-            return "safe", score, f"ML model predicted {top_label}"
-
+    if intent_model is not None:
+        try:
+            preds = intent_model(
+                transcript,
+                candidate_labels=INTENT_LABELS,
+                hypothesis_template=INTENT_TEMPLATE,
+                truncation=True,
+            )
+            top_label = preds["labels"][0].lower()
+            score = float(preds["scores"][0])
+            if top_label in SCAM_LABELS:
+                return "scam", score, "ML model flagged: %s" % top_label
+            return "safe", score, "ML model predicted: %s" % top_label
+        except Exception as e:
+            if DEBUG:
+                print("Intent model inference failed; using fallback:", e)
 
     lower = transcript.lower()
     scam_keywords = [
         "transfer", "transf", "code", "compte", "argent", "virement",
-        "urgent", "impots", "impôts", "tax", "bank", "verify", "security"
+        "urgent", "impots", "impôts", "tax", "bank", "verify", "security",
     ]
     for kw in scam_keywords:
         if kw in lower:
-            return "scam", 0.92, f"Keyword detected: {kw}"
+            return "scam", 0.92, "Keyword detected: %s" % kw
     return "safe", 0.4, "Fallback heuristic"
+
+
+def build_analysis(speaker, timestamp_ms, transcript, language,
+                   intent_label, intent_conf, rationale,
+                   spoof_label, spoof_conf):
+    """Compose the analysis payload sent back over the WebSocket."""
+    out = {
+        "type": "analysis",
+        "speaker": speaker,
+        "timestamp_ms": timestamp_ms,
+        "text": transcript,
+        "language": language,
+        "intent_label": intent_label,
+        "intent_confidence": round(intent_conf, 2),
+        "rationale": rationale,
+        "spoof_label": spoof_label,
+        "spoof_confidence": round(spoof_conf, 2),
+    }
+    return out
+
+
+async def analyze_speaker(call_id, speaker, timestamp_ms, audio_np):
+    """Run the full STT + spoof + intent pipeline on a buffered audio window."""
+    speech_buffers[call_id][speaker] = []
+
+    transcript, language = await stt_whisper_from_array(audio_np)
+    spoof_label, spoof_conf = await spoof_real_from_array(audio_np)
+    intent_label, intent_conf, rationale = detect_intent(transcript)
+
+    score_history[call_id][speaker].append(intent_conf)
+    recent_scores = score_history[call_id][speaker][-WINDOW_SIZE:]
+    smoothed_conf = sum(recent_scores) / len(recent_scores)
+
+    return build_analysis(
+        speaker, timestamp_ms, transcript, language,
+        intent_label, smoothed_conf, rationale,
+        spoof_label, spoof_conf,
+    )
+
+
+def build_report(call_id):
+    report = {"call_id": call_id, "segments": []}
+    for sp in ("caller", "user"):
+        for ts, fname in call_saved_segments[call_id][sp]:
+            report["segments"].append({"timestamp_ms": ts, "speaker": sp, "file": fname})
+    return report
+
+
+@app.get("/health")
+async def health():
+    return JSONResponse({
+        "status": "ok",
+        "whisper_loaded": model is not None,
+        "intent_model_loaded": intent_model is not None,
+    })
 
 
 @app.websocket("/ws/{call_id}")
@@ -192,7 +279,7 @@ async def ws_endpoint(websocket: WebSocket, call_id: str):
     await websocket.accept()
     ensure_call(call_id)
     if DEBUG:
-        print(f"Client connected for call {call_id}")
+        print("Client connected for call %s" % call_id)
 
     try:
         while True:
@@ -200,9 +287,9 @@ async def ws_endpoint(websocket: WebSocket, call_id: str):
             msg = json.loads(text)
 
             if msg.get("type") == "chunk":
-                speaker = msg["speaker"]
-                timestamp_ms = msg["timestamp_ms"]
-                pcm_bytes = base64.b64decode(msg["audio_chunk"])
+                speaker = msg.get("speaker", "caller")
+                timestamp_ms = msg.get("timestamp_ms", 0)
+                pcm_bytes = base64.b64decode(msg.get("audio_chunk", ""))
 
                 fname = save_chunk(call_id, speaker, timestamp_ms, pcm_bytes)
                 call_saved_segments[call_id][speaker].append((timestamp_ms, fname))
@@ -213,79 +300,32 @@ async def ws_endpoint(websocket: WebSocket, call_id: str):
                 total_samples = sum(arr.shape[0] for arr in speech_buffers[call_id][speaker])
                 if total_samples >= MIN_SAMPLES_TO_TRANSCRIBE:
                     to_transcribe = np.concatenate(speech_buffers[call_id][speaker])
-                    speech_buffers[call_id][speaker] = []
-
-                    transcript, language = await stt_whisper_from_array(to_transcribe)
-                    spoof_label, spoof_conf = await spoof_real_from_array(to_transcribe)
-                    intent_label, intent_conf, rationale = detect_intent(transcript)
-
-                    score_history[call_id][speaker].append(intent_conf)
-                    window_size = 5
-                    recent_scores = score_history[call_id][speaker][-window_size:]
-                    smoothed_conf = sum(recent_scores) / len(recent_scores)
-
-                    out = {
-                        "type": "analysis",
-                        "speaker": speaker,
-                        "timestamp_ms": timestamp_ms,
-                        "text": transcript,
-                        "language": language,
-                        "intent_label": intent_label,
-                        "intent_confidence": round(smoothed_conf, 2),
-                        "rationale": rationale,
-                        "spoof_label": spoof_label,
-                        "spoof_confidence": round(spoof_conf, 2)
-                    }
-                    await websocket.send_text(json.dumps(out))
-                else:
-                    if DEBUG:
-                        print(f"[DEBUG] Buffering {total_samples} samples for {call_id}/{speaker}")
+                    analysis = await analyze_speaker(call_id, speaker, timestamp_ms, to_transcribe)
+                    await websocket.send_text(json.dumps(analysis))
+                elif DEBUG:
+                    print("[DEBUG] Buffering %d samples for %s/%s" % (total_samples, call_id, speaker))
 
             elif msg.get("type") == "end_call":
-                for sp in ["caller", "user"]:
+                for sp in ("caller", "user"):
                     if speech_buffers[call_id][sp]:
                         remaining = np.concatenate(speech_buffers[call_id][sp])
                         if remaining.size > 0:
-                            transcript, language = await stt_whisper_from_array(remaining)
-                            spoof_label, spoof_conf = await spoof_real_from_array(remaining)
-                            intent_label, intent_conf, rationale = detect_intent(transcript)
+                            analysis = await analyze_speaker(call_id, sp, 0, remaining)
+                            await websocket.send_text(json.dumps(analysis))
 
-                            score_history[call_id][sp].append(intent_conf)
-                            recent_scores = score_history[call_id][sp][-5:]
-                            smoothed_conf = sum(recent_scores) / len(recent_scores)
-
-                            out = {
-                                "type": "analysis",
-                                "speaker": sp,
-                                "timestamp_ms": 0,
-                                "text": transcript,
-                                "language": language,
-                                "intent_label": intent_label,
-                                "intent_confidence": round(smoothed_conf, 2),
-                                "rationale": rationale,
-                                "spoof_label": spoof_label,
-                                "spoof_confidence": round(spoof_conf, 2)
-                            }
-                            await websocket.send_text(json.dumps(out))
-                        speech_buffers[call_id][sp] = []
-
-                report = {"call_id": call_id, "segments": []}
-                for sp in ["caller", "user"]:
-                    for ts, fname in call_saved_segments[call_id][sp]:
-                        report["segments"].append({"timestamp_ms": ts, "speaker": sp, "file": fname})
-                await websocket.send_text(json.dumps({"type": "report", "report": report}))
+                await websocket.send_text(json.dumps({"type": "report", "report": build_report(call_id)}))
 
             else:
                 await websocket.send_text(json.dumps({"type": "error", "message": "unknown message type"}))
 
     except WebSocketDisconnect:
         if DEBUG:
-            print(f"Client disconnected for call {call_id}")
+            print("Client disconnected for call %s" % call_id)
     except Exception as exc:
         if DEBUG:
             print("Exception in ws handler:", exc)
 
 
-@app.get("/")
-async def index():
-    return HTMLResponse("<h3>Voice Scam Shield backend running</h3>")
+# Static frontend (index.html) is served by the backend itself, so a single
+# command brings up the whole demo. Must be registered after the API routes.
+app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")

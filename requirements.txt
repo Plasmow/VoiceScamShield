@@ -1,10 +1,12 @@
---- requirements.txt ---
-fastapi
-uvicorn[standard]
+# Core backend
+fastapi>=0.110
+uvicorn[standard]>=0.29
+# Audio processing
 numpy
-pydub
 soundfile
 librosa
-python-multipart
-websockets
+# Speech-to-text (pulls in torch automatically)
 openai-whisper
+# Zero-shot intent classification
+transformers>=4.44
+sentencepiece

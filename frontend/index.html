@@ -17,6 +17,7 @@
   .controls{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
   input[type="text"]{padding:8px;border-radius:8px;border:1px solid #e6e9ee;width:160px}
   button{background:var(--accent);color:#fff;border:0;padding:8px 12px;border-radius:10px;cursor:pointer}
+  button:disabled{opacity:.5;cursor:not-allowed}
   button.ghost{background:transparent;color:var(--accent);border:1px solid rgba(30,144,255,0.12)}
   .small{font-size:13px;padding:6px 10px}
   .log{height:300px;overflow:auto;background:#0f1724;color:#cbd5e1;padding:12px;border-radius:8px;font-family:monospace;font-size:13px}
@@ -37,7 +38,7 @@
       <header>
         <div>
           <h1>Voice Scam Shield — Live Demo</h1>
-          <div style="color:var(--muted);font-size:13px">Real-time scam intent & anti-spoofing (Whisper + heuristic)</div>
+          <div style="color:var(--muted);font-size:13px">Real-time scam intent &amp; anti-spoofing (Whisper + zero-shot NLI)</div>
         </div>
       </header>
 
@@ -95,183 +96,243 @@
       <h3 style="margin:0 0 8px 0">How it works</h3>
       <ol style="color:var(--muted)">
         <li>Capture mic chunks or stream a WAV file to backend via WebSocket</li>
-        <li>Backend runs Whisper for ASR + anti-spoofing heuristic</li>
-        <li>UI computes weighted risk score and shows live alerts</li>
+        <li>Backend runs Whisper for ASR + a zero-shot NLI model for intent + spectral anti-spoofing</li>
+        <li>UI computes a weighted risk score and shows live alerts with TTS warning</li>
       </ol>
-      <div style="margin-top:12px;color:var(--muted)">Made for learning — replace heuristic anti-spoof with AASIST for production-grade detection.</div>
+      <div style="margin-top:12px;color:var(--muted)">Made for learning — replace the heuristic anti-spoof with AASIST for production-grade detection.</div>
     </div>
   </div>
 </div>
 
 <script>
-/* FRONTEND LOGIC (keeps existing behaviors + nicer UI) */
-const WS_BASE = "ws://localhost:8000/ws/";
+/* FRONTEND LOGIC */
+const WS_PORT = 8000;
+// Works when the page is served by the backend (:8000), by a static server
+// (:5500) or opened directly from disk (file://) — always targets :8000.
+const _host = location.hostname && location.hostname !== '' ? location.hostname : 'localhost';
+const WS_BASE = (location.protocol === 'https:' ? 'wss://' : 'ws://')
+  + (location.port === String(WS_PORT) ? location.host : _host + ':' + WS_PORT) + '/ws/';
+
 let ws = null;
 let audioCtx = null, mediaStream = null, sourceNode = null, processor = null;
-let buffer = [], sending=false, segments=[];
-const sendInterval = 1000;
+let buffer = [], sending = false, segments = [];
+const sendInterval = 1000; // ms between mic transmissions
 const riskThreshold = 0.75;
 
-function log(msg){
+function log(msg) {
   const el = document.getElementById('log');
-  el.textContent = (new Date()).toLocaleTimeString() + " - " + msg + "\\n" + el.textContent;
+  el.textContent = (new Date()).toLocaleTimeString() + ' - ' + msg + '\n' + el.textContent;
 }
 
-function floatTo16BitPCM(float32Array){
+function escapeHTML(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+function floatTo16BitPCM(float32Array) {
   const l = float32Array.length;
-  const buf = new ArrayBuffer(l*2);
+  const buf = new ArrayBuffer(l * 2);
   const view = new DataView(buf);
-  let offset = 0;
-  for (let i=0;i<l;i++){
+  for (let i = 0; i < l; i++) {
     let s = Math.max(-1, Math.min(1, float32Array[i]));
-    view.setInt16(offset, s < 0 ? s*0x8000 : s*0x7FFF, true);
-    offset+=2;
+    view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
   }
   return new Uint8Array(buf);
 }
 
-async function ensureWS(callId){
+/* btoa(String.fromCharCode(...bytes)) crashes for large buffers (arg count
+   limits), so encode in slices. */
+function bytesToBase64(bytes) {
+  let binary = '';
+  const SLICE = 0x8000;
+  for (let i = 0; i < bytes.length; i += SLICE) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + SLICE));
+  }
+  return btoa(binary);
+}
+
+async function ensureWS(callId) {
   if (ws && ws.readyState === 1) return ws;
   return new Promise((resolve, reject) => {
-    ws = new WebSocket(WS_BASE + callId);
+    try {
+      ws = new WebSocket(WS_BASE + encodeURIComponent(callId));
+    } catch (e) {
+      log('WS constructor error: ' + e.message);
+      return reject(e);
+    }
     ws.onopen = () => { log('WS connected ' + callId); resolve(ws); };
-    ws.onerror = (e) => { log('WS error - make sure backend is running'); reject(e); };
-    ws.onclose = ()=> log('WS closed');
+    ws.onerror = () => { log('WS error - make sure the backend is running on port ' + WS_PORT); reject(new Error('connection failed')); };
+    ws.onclose = () => log('WS closed');
     ws.onmessage = (ev) => {
-      const m = JSON.parse(ev.data);
+      let m;
+      try { m = JSON.parse(ev.data); } catch { return log('Bad JSON from server'); }
       if (m.type === 'analysis') handleAnalysis(m);
-      else if (m.type === 'report'){ log('REPORT: ' + JSON.stringify(m.report)); document.getElementById('downloadReport').disabled=false; window.latestReport=m.report; }
-      else log('MSG: ' + ev.data);
+      else if (m.type === 'report') {
+        log('REPORT received: ' + (m.report.segments ? m.report.segments.length : 0) + ' segments');
+        document.getElementById('downloadReport').disabled = false;
+        window.latestReport = m.report;
+      } else log('MSG: ' + ev.data);
     };
   });
 }
 
-async function startMic(){
+async function startMic() {
   const callId = document.getElementById('callId').value || 'demo1';
-  try{
-    await ensureWS(callId);
-  }catch(e){
-    log('Failed to open WS: ' + e);
-    return;
-  }
-  try{
-    audioCtx = new (window.AudioContext || window.webkitAudioContext)({sampleRate:16000});
-    mediaStream = await navigator.mediaDevices.getUserMedia({audio:true});
+  try { await ensureWS(callId); }
+  catch (e) { return; /* error already logged */ }
+
+  try {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+    mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
     sourceNode = audioCtx.createMediaStreamSource(mediaStream);
-    processor = audioCtx.createScriptProcessor(4096,1,1);
+    processor = audioCtx.createScriptProcessor(4096, 1, 1);
     sourceNode.connect(processor); processor.connect(audioCtx.destination);
-    processor.onaudioprocess = (e)=>{ buffer.push(new Float32Array(e.inputBuffer.getChannelData(0))); };
+    processor.onaudioprocess = (e) => { buffer.push(new Float32Array(e.inputBuffer.getChannelData(0))); };
     sending = true;
-    sendLoop(callId);
+    sendLoop();
     document.getElementById('startBtn').disabled = true;
     document.getElementById('stopBtn').disabled = false;
-    log('Mic started');
-  }catch(err){
+    log('Mic started (' + audioCtx.sampleRate + ' Hz)');
+  } catch (err) {
     log('Mic start error: ' + err.message);
   }
 }
 
-async function sendLoop(callId){
-  while(sending){
-    await new Promise(r=>setTimeout(r, sendInterval));
+async function sendLoop() {
+  while (sending) {
+    await new Promise(r => setTimeout(r, sendInterval));
     if (!buffer.length) continue;
-    let len=0; for (const b of buffer) len+=b.length;
-    const tmp = new Float32Array(len); let off=0; for (const b of buffer){ tmp.set(b, off); off+=b.length; }
+    let len = 0; for (const b of buffer) len += b.length;
+    const tmp = new Float32Array(len); let off = 0;
+    for (const b of buffer) { tmp.set(b, off); off += b.length; }
     buffer = [];
     const pcm = floatTo16BitPCM(tmp);
-    const b64 = btoa(String.fromCharCode(...pcm));
     const speaker = document.getElementById('speakerSel').value;
-    try { ws.send(JSON.stringify({type:'chunk', speaker, timestamp_ms: Date.now(), audio_chunk: b64})); log('Sent mic chunk'); }
-    catch(e){ log('Failed send chunk: ' + e.message); }
+    try {
+      ws.send(JSON.stringify({ type: 'chunk', speaker, timestamp_ms: Date.now(), audio_chunk: bytesToBase64(pcm) }));
+      log('Sent mic chunk (' + (pcm.length / 2 / 16000).toFixed(1) + 's, ' + speaker + ')');
+    } catch (e) { log('Failed to send chunk: ' + e.message); }
   }
 }
 
-function stopMic(){
+function endCall() {
+  if (ws && ws.readyState === 1) {
+    try { ws.send(JSON.stringify({ type: 'end_call' })); } catch (e) { /* ignore */ }
+  }
+}
+
+function stopMic() {
   sending = false;
-  if (processor) { processor.disconnect(); processor=null; }
-  if (sourceNode) { sourceNode.disconnect(); sourceNode=null; }
-  if (mediaStream) { mediaStream.getTracks().forEach(t=>t.stop()); mediaStream=null; }
-  try{ if (ws && ws.readyState===1) { ws.send(JSON.stringify({type:'end_call'})); ws.close(); } }catch(e){}
+  if (processor) { processor.disconnect(); processor = null; }
+  if (sourceNode) { sourceNode.disconnect(); sourceNode = null; }
+  if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+  if (audioCtx) { audioCtx.close().catch(() => {}); audioCtx = null; }
+  endCall();
+  setTimeout(() => { if (ws && ws.readyState === 1) ws.close(); }, 500); // let end_call + report arrive
   document.getElementById('startBtn').disabled = false;
   document.getElementById('stopBtn').disabled = true;
-  log('Stopped');
+  log('Stopped — waiting for final analysis/report…');
 }
 
-async function streamFile(file){
-  const callId = document.getElementById('callId').value || 'demo1';
-  try{ await ensureWS(callId); } catch(e){ log('WS error: ' + e); return; }
-  const arrayBuf = await file.arrayBuffer();
-  const offlineCtx = new (window.OfflineAudioContext || window.webkitOfflineAudioContext)(1,1,16000);
+async function decodeTo16k(arrayBuf) {
   const tempCtx = new (window.AudioContext || window.webkitAudioContext)();
-  const audioBuf = await tempCtx.decodeAudioData(arrayBuf.slice(0));
-  // Resample if needed to 16k
-  let resampled = audioBuf.getChannelData(0);
-  if (audioBuf.sampleRate !== 16000){
-    const offline = new OfflineAudioContext(1, Math.ceil(resampled.length * 16000 / audioBuf.sampleRate), 16000);
-    const buf = offline.createBuffer(1, resampled.length, audioBuf.sampleRate);
-    buf.copyToChannel(resampled, 0);
-    const src = offline.createBufferSource(); src.buffer = buf; src.connect(offline.destination); src.start(0);
+  const decoded = await tempCtx.decodeAudioData(arrayBuf);
+  await tempCtx.close().catch(() => {});
+  let data = decoded.getChannelData(0);
+  if (decoded.sampleRate !== 16000) {
+    const targetLen = Math.max(1, Math.ceil(data.length * 16000 / decoded.sampleRate));
+    const offline = new OfflineAudioContext(1, targetLen, 16000);
+    const buf = offline.createBuffer(1, decoded.length, decoded.sampleRate);
+    buf.copyToChannel(data, 0);
+    const src = offline.createBufferSource();
+    src.buffer = buf; src.connect(offline.destination); src.start(0);
     const rendered = await offline.startRendering();
-    resampled = rendered.getChannelData(0);
+    data = rendered.getChannelData(0);
   }
-  const chunkSize = 16000; // 1s
-  for (let i=0;i<resampled.length;i+=chunkSize){
-    const chunk = resampled.subarray(i, i+chunkSize);
-    const pcm = floatTo16BitPCM(chunk);
-    const b64 = btoa(String.fromCharCode(...pcm));
-    try { ws.send(JSON.stringify({type:'chunk', speaker:'caller', timestamp_ms: Date.now(), audio_chunk: b64})); log('Sent file chunk ' + (i/chunkSize+1)); }
-    catch(e){ log('Send error: ' + e.message); break; }
-    await new Promise(r=>setTimeout(r, 200));
-  }
+  return data;
 }
 
-function handleAnalysis(m){
-  // risk = 0.7*intent_conf + 0.3*spoof_conf
+async function streamFile(file) {
+  const callId = document.getElementById('callId').value || 'demo1';
+  try { await ensureWS(callId); } catch { return; }
+  let resampled;
+  try { resampled = await decodeTo16k(await file.arrayBuffer()); }
+  catch (e) { log('Could not decode audio file: ' + e.message); return; }
+
+  const chunkSize = 16000; // 1s per chunk
+  for (let i = 0; i < resampled.length; i += chunkSize) {
+    const chunk = resampled.subarray(i, i + chunkSize);
+    if (!chunk.length) break;
+    const pcm = floatTo16BitPCM(chunk);
+    try {
+      ws.send(JSON.stringify({ type: 'chunk', speaker: 'caller', timestamp_ms: Date.now(), audio_chunk: bytesToBase64(pcm) }));
+      log('Sent file chunk ' + (Math.floor(i / chunkSize) + 1));
+    } catch (e) { log('Send error: ' + e.message); break; }
+    await new Promise(r => setTimeout(r, 200));
+  }
+  endCall(); // flush remaining buffer + trigger report
+  log('File stream finished — waiting for final report…');
+}
+
+function handleAnalysis(m) {
+  // risk = 0.7 * intent confidence + 0.3 * spoof confidence
   const intentC = m.intent_confidence || 0;
   const spoofC = m.spoof_confidence || 0;
-  const risk = (intentC*0.7) + (spoofC*0.3);
+  const risk = Math.min(1, (intentC * 0.7) + (spoofC * 0.3));
   document.getElementById('riskScore').textContent = risk.toFixed(2);
-  document.getElementById('riskBar').style.width = Math.min(1, risk) * 100 + "%";
+  document.getElementById('riskBar').style.width = (risk * 100) + '%';
   const labelEl = document.getElementById('riskLabel');
   if (risk > riskThreshold) { labelEl.textContent = 'SCAM'; labelEl.style.background = '#fff0f0'; labelEl.style.color = '#b30000'; }
   else if (m.intent_label === 'scam') { labelEl.textContent = 'suspicious'; labelEl.style.background = '#fff7ed'; labelEl.style.color = '#b36b00'; }
   else { labelEl.textContent = 'safe'; labelEl.style.background = '#eef6ff'; labelEl.style.color = '#0b69ff'; }
   document.getElementById('langTag').textContent = 'lang: ' + (m.language || '-');
-  // add to transcript list
-  const div = document.createElement('div'); div.className = 'segment';
-  div.innerHTML = `<div style="font-weight:600">${m.speaker} — ${m.intent_label} <span style="float:right">${(m.spoof_label||'')} (${(m.spoof_confidence||0)})</span></div>
-                   <div style="color:var(--muted);margin-top:6px">${m.text}</div>
-                   <div style="font-size:12px;margin-top:6px;color:var(--muted)">rationale: ${m.rationale || '-'}</div>`;
-  const list = document.getElementById('transcriptList'); list.prepend(div);
+
+  // Add to transcript list (text content escaped — server text is untrusted)
+  const div = document.createElement('div');
+  div.className = 'segment';
+  div.innerHTML =
+    '<div style="font-weight:600">' + escapeHTML(m.speaker) + ' — ' + escapeHTML(m.intent_label) +
+    ' <span style="float:right">' + escapeHTML(m.spoof_label) + ' (' + escapeHTML(m.spoof_confidence) + ')</span></div>' +
+    '<div style="color:var(--muted);margin-top:6px">' + escapeHTML(m.text) + '</div>' +
+    '<div style="font-size:12px;margin-top:6px;color:var(--muted)">rationale: ' + escapeHTML(m.rationale) + '</div>';
+  document.getElementById('transcriptList').prepend(div);
   segments.push(m);
-  // small TTS alert if high risk (non-intrusive)
-  if (risk > riskThreshold){
-    try{
+
+  // Voice alert on high risk
+  if (risk > riskThreshold) {
+    try {
       const utter = new SpeechSynthesisUtterance('Warning: possible scam call. Do not share codes or money.');
       utter.lang = (m.language && m.language.startsWith('fr')) ? 'fr-FR' : 'en-US';
       utter.volume = 0.7; utter.rate = 1.0;
       window.speechSynthesis.speak(utter);
-    }catch(e){ log('TTS not available'); }
+    } catch (e) { log('TTS not available'); }
   }
 }
 
 document.getElementById('startBtn').onclick = startMic;
 document.getElementById('stopBtn').onclick = stopMic;
-document.getElementById('sendFile').onclick = ()=> {
+document.getElementById('sendFile').onclick = () => {
   const f = document.getElementById('fileInput').files[0];
   if (!f) return alert('Select a WAV file first');
   streamFile(f);
 };
-document.getElementById('playFile').onclick = ()=>{
+document.getElementById('playFile').onclick = () => {
   const f = document.getElementById('fileInput').files[0];
   if (!f) return alert('Select a file');
   const audio = new Audio(URL.createObjectURL(f)); audio.play();
   log('Playing file locally');
 };
-document.getElementById('downloadReport').onclick = ()=>{
-  const report = {call_id:document.getElementById('callId').value||'demo1', segments, summary:'Prototype report'};
-  const blob = new Blob([JSON.stringify(report,null,2)],{type:'application/json'});
-  const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download='call_report.json'; a.click(); URL.revokeObjectURL(url);
+document.getElementById('downloadReport').onclick = () => {
+  const report = Object.assign(
+    { call_id: document.getElementById('callId').value || 'demo1', segments, summary: 'Prototype report' },
+    window.latestReport || {}
+  );
+  const blob = new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = 'call_report.json'; a.click();
+  URL.revokeObjectURL(url);
 };
 </script>
 </body>
