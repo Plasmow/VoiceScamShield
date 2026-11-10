@@ -15,7 +15,9 @@ Voice Scam Shield listens to a phone call *while it is happening*, transcribes e
   <img src="https://img.shields.io/badge/FastAPI-WebSocket-green" alt="FastAPI WebSocket">
   <img src="https://img.shields.io/badge/OpenAI-Whisper-orange" alt="OpenAI Whisper">
   <img src="https://img.shields.io/badge/HuggingFace-Zero--shot%20XLM--R-FFD21E" alt="Hugging Face">
-  <img src="https://img.shields.io/badge/license-MIT-informational" alt="MIT License">
+</p>
+<p align="center">
+  <em>🧪 Projet de hackathon (Hack Nation × MIT Hackathon) — pas encore de licence, voir <a href="#%EF%B8%8F-disclaimer">Disclaimer</a></em>
 </p>
 
 ---
@@ -182,3 +184,5 @@ Built with ❤️ and a lot of coffee at the **Hack Nation × MIT Hackathon**.
 ## ⚖️ Disclaimer
 
 Prototype built for a hackathon. The intent classifier and anti-spoofing heuristics are **not** production-grade and will produce false positives/negatives — don't rely on it for real fraud prevention without proper evaluation.
+
+**License:** none yet — this is a hackathon project (Hack Nation × MIT Hackathon). © 2025-2026 the Voice Scam Shield team; all rights reserved until a license is chosen. Ping us if you want to reuse the code or collaborate.
